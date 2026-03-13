@@ -3,6 +3,68 @@
  * Updates: Renamed Tabs, Cleaned UI, Fixed Budget Display
  */
 
+let currentInventoryScope = 'shared';
+let currentShoppingScope = 'shared';
+
+const ALERT_URGENCY = {
+    buy_now: { label: 'Buy now', chip: 'NOW', className: 'urgency-now' },
+    buy_very_soon: { label: 'Buy very soon', chip: 'SOON', className: 'urgency-soon' },
+    out_of_stock: { label: 'Out of stock', chip: 'OUT', className: 'urgency-out' }
+};
+
+function getAlertMeta(level) {
+    return ALERT_URGENCY[level] || ALERT_URGENCY.buy_now;
+}
+
+function formatRelativeTime(isoDate) {
+    if (!isoDate) return 'just now';
+    const deltaSec = Math.floor((Date.now() - new Date(isoDate).getTime()) / 1000);
+    if (deltaSec < 60) return `${deltaSec}s ago`;
+    if (deltaSec < 3600) return `${Math.floor(deltaSec / 60)}m ago`;
+    if (deltaSec < 86400) return `${Math.floor(deltaSec / 3600)}h ago`;
+    return `${Math.floor(deltaSec / 86400)}d ago`;
+}
+
+function getCurrentUserLabel() {
+    return localStorage.getItem('alfred_profile_name') || 'Roommate';
+}
+
+function notify(message) {
+    const el = document.getElementById('inline-notice');
+    if (!el) return;
+    el.textContent = message;
+    el.classList.remove('hidden');
+    clearTimeout(window.noticeTimer);
+    window.noticeTimer = setTimeout(() => el.classList.add('hidden'), 2800);
+}
+
+function maybePushLocalNotification(title, body) {
+    if (!('Notification' in window)) return;
+    if (Notification.permission === 'granted') {
+        new Notification(title, { body });
+    }
+}
+
+async function ensureInventoryDefaults() {
+    const items = await db.getAll('inventory');
+    for (const item of items) {
+        let changed = false;
+        if (!item.scope) {
+            item.scope = 'shared';
+            changed = true;
+        }
+        if (!item.ownerUserId) {
+            item.ownerUserId = getCurrentUserLabel();
+            changed = true;
+        }
+        if (item.onShoppingList === undefined) {
+            item.onShoppingList = false;
+            changed = true;
+        }
+        if (changed) await db.update('inventory', item);
+    }
+}
+
 document.addEventListener('DOMContentLoaded', async () => {
     
     // --- 1. SPLASH SCREEN (Moved to top for safety) ---
@@ -26,6 +88,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         
         // Seed data if empty (this might take a moment)
         await db.seedInitialData(); 
+        await ensureInventoryDefaults();
         
         console.log("Database ready.");
         loadInventoryView(); 
@@ -37,6 +100,10 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
 
     initNavigation();
+    initScopeToggleEvents();
+    if ('Notification' in window && Notification.permission === 'default') {
+        Notification.requestPermission().catch(() => {});
+    }
     registerServiceWorker();
 });
 
@@ -69,6 +136,26 @@ function initNavigation() {
             if (targetId === 'view-shopping') loadShoppingView();
             if (targetId === 'view-expenses') loadExpensesView();
             if (targetId === 'view-cooking') loadCookingView();
+        });
+    });
+}
+
+function initScopeToggleEvents() {
+    document.querySelectorAll('[data-scope-target="inventory"]').forEach(btn => {
+        btn.addEventListener('click', () => {
+            document.querySelectorAll('[data-scope-target="inventory"]').forEach(el => el.classList.remove('active'));
+            btn.classList.add('active');
+            currentInventoryScope = btn.dataset.scope;
+            loadInventoryView();
+        });
+    });
+
+    document.querySelectorAll('[data-scope-target="shopping"]').forEach(btn => {
+        btn.addEventListener('click', () => {
+            document.querySelectorAll('[data-scope-target="shopping"]').forEach(el => el.classList.remove('active'));
+            btn.classList.add('active');
+            currentShoppingScope = btn.dataset.scope;
+            loadShoppingView();
         });
     });
 }
@@ -112,26 +199,46 @@ function registerServiceWorker() {
     }
 }
 
+function refreshActiveView() {
+    const activeView = document.querySelector('.active-view')?.id;
+    if (activeView === 'view-inventory') loadInventoryView();
+    if (activeView === 'view-shopping') loadShoppingView();
+    if (activeView === 'view-cooking') loadCookingView();
+    if (activeView === 'view-expenses') loadExpensesView();
+}
+
 // ==========================================
 // 2. INVENTORY LOGIC (Store)
 // ==========================================
 
 async function loadInventoryView() {
-    const listContainer = document.getElementById('inventory-list');
     try {
-        const items = await db.getAll('inventory');
-        renderInventoryList(items);
+        const [items, alerts] = await Promise.all([
+            db.getAll('inventory'),
+            db.getAll('alerts')
+        ]);
+
+        const filteredItems = items.filter(item => item.scope === currentInventoryScope);
+        const activeAlerts = alerts.filter(a => a.status === 'active');
+        const alertByItemId = activeAlerts.reduce((acc, alert) => {
+            if (!acc[alert.itemId]) acc[alert.itemId] = [];
+            acc[alert.itemId].push(alert);
+            return acc;
+        }, {});
+
+        renderInventoryList(filteredItems, alertByItemId);
     } catch (err) {
         console.error(err);
     }
 }
 
-function renderInventoryList(items) {
+function renderInventoryList(items, alertByItemId) {
     const listContainer = document.getElementById('inventory-list');
     listContainer.innerHTML = '';
 
     if (items.length === 0) {
-        listContainer.innerHTML = '<div class="empty-state">Store is empty. Tap + to add items.</div>';
+        const scopeLabel = currentInventoryScope === 'shared' ? 'Shared Home' : 'My Items';
+        listContainer.innerHTML = `<div class="empty-state">${scopeLabel} is empty. Tap + to add items.</div>`;
         return;
     }
 
@@ -158,13 +265,24 @@ function renderInventoryList(items) {
             
             const isManualShop = item.onShoppingList === true;
             const cartClass = isManualShop ? 'btn-cart active' : 'btn-cart';
+            const itemAlerts = alertByItemId[item.id] || [];
+            const latestAlert = itemAlerts.sort((a, b) => new Date(b.raisedAt) - new Date(a.raisedAt))[0];
+
+            const scopeChip = item.scope === 'shared' ? '<span class="scope-chip scope-shared">Shared</span>' : '<span class="scope-chip scope-personal">Personal</span>';
+            const urgencyChip = latestAlert
+                ? `<span class="alert-chip ${getAlertMeta(latestAlert.urgency).className}">${getAlertMeta(latestAlert.urgency).chip}</span>`
+                : '';
+            const alertButton = item.scope === 'shared'
+                ? `<button class="btn-alert" onclick="openAlertModal(${item.id})">Raise Alert</button>`
+                : '';
 
             card.innerHTML = `
                 <div class="card-info" onclick="editInventoryItem(${item.id})">
-                    <div class="card-name">${item.name}</div>
+                    <div class="card-name">${item.name} ${scopeChip} ${urgencyChip}</div>
                     <div class="card-meta">${item.store}</div>
                 </div>
                 <div class="card-actions">
+                    ${alertButton}
                     <button class="${cartClass}" onclick="toggleShoppingStatus(${item.id})">🛒</button>
                     <button class="btn-qty" onclick="updateStock(${item.id}, -1)">-</button>
                     <span class="qty-display">${item.quantity} <span style="font-size:0.7em">${item.unit}</span></span>
@@ -182,7 +300,7 @@ async function toggleShoppingStatus(id) {
     if (!item) return;
     item.onShoppingList = !item.onShoppingList;
     await db.update('inventory', item);
-    loadInventoryView(); 
+    refreshActiveView();
 }
 
 async function updateStock(id, change) {
@@ -195,33 +313,135 @@ async function updateStock(id, change) {
     item.quantity = Math.round(item.quantity * 100) / 100;
 
     await db.update('inventory', item);
-    loadInventoryView(); 
+    refreshActiveView();
 }
+
+window.openAlertModal = async function(itemId) {
+    const item = await db.get('inventory', itemId);
+    if (!item || item.scope !== 'shared') {
+        notify('Only shared items can raise group alerts.');
+        return;
+    }
+
+    const html = `
+        <input type="hidden" id="alert-item-id" value="${item.id}">
+        <p style="margin-bottom:10px; color:#aaa;">Raise shared alert for <strong>${item.name}</strong></p>
+        <div class="form-group"><label>Urgency</label>
+            <select id="alert-urgency">
+                <option value="buy_now">Buy now</option>
+                <option value="buy_very_soon">Buy very soon</option>
+                <option value="out_of_stock">Out of stock</option>
+            </select>
+        </div>
+    `;
+
+    openModal('modal-alert', 'Raise Shared Alert', html, saveSharedAlert);
+};
+
+async function saveSharedAlert() {
+    const itemId = parseInt(document.getElementById('alert-item-id').value, 10);
+    const urgency = document.getElementById('alert-urgency').value;
+    const item = await db.get('inventory', itemId);
+    if (!item) return;
+
+    const activeAlerts = await db.getAll('alerts');
+    const duplicate = activeAlerts.find(a => a.itemId === itemId && a.status === 'active' && a.urgency === urgency);
+    if (duplicate) {
+        closeModal();
+        notify(`Alert already active for ${item.name}.`);
+        return;
+    }
+
+    await db.add('alerts', {
+        itemId: item.id,
+        itemName: item.name,
+        scope: 'shared',
+        urgency,
+        status: 'active',
+        raisedBy: getCurrentUserLabel(),
+        raisedAt: new Date().toISOString(),
+        handledBy: null,
+        handledAt: null
+    });
+
+    item.onShoppingList = true;
+    await db.update('inventory', item);
+
+    closeModal();
+    notify(`Shared alert sent: ${item.name} (${getAlertMeta(urgency).label}).`);
+    maybePushLocalNotification(`Shared item alert: ${item.name}`, `${getAlertMeta(urgency).label} • Raised by ${getCurrentUserLabel()}`);
+    refreshActiveView();
+}
+
+window.markAlertHandled = async function(alertId) {
+    const alertRecord = await db.get('alerts', alertId);
+    if (!alertRecord || alertRecord.status !== 'active') return;
+
+    alertRecord.status = 'handled';
+    alertRecord.handledBy = getCurrentUserLabel();
+    alertRecord.handledAt = new Date().toISOString();
+    await db.update('alerts', alertRecord);
+
+    const remainingActive = (await db.getAll('alerts')).some(a => a.status === 'active' && a.itemId === alertRecord.itemId);
+    if (!remainingActive) {
+        const item = await db.get('inventory', alertRecord.itemId);
+        if (item) {
+            item.onShoppingList = false;
+            await db.update('inventory', item);
+        }
+    }
+
+    notify(`Alert handled for ${alertRecord.itemName}.`);
+    refreshActiveView();
+};
 
 // ==========================================
 // 3. SHOPPING LOGIC (Procure)
 // ==========================================
 
 async function loadShoppingView() {
-    const listContainer = document.getElementById('shopping-list');
     try {
-        const items = await db.getAll('inventory');
-        const toBuy = items.filter(item => 
-            item.quantity <= item.restock || item.onShoppingList === true
-        );
-        renderShoppingList(toBuy);
+        const [items, alerts] = await Promise.all([
+            db.getAll('inventory'),
+            db.getAll('alerts')
+        ]);
+
+        const scopedItems = items.filter(item => item.scope === currentShoppingScope);
+        const activeAlerts = alerts.filter(a => a.status === 'active');
+        const alertByItemId = activeAlerts.reduce((acc, alert) => {
+            if (!acc[alert.itemId]) acc[alert.itemId] = [];
+            acc[alert.itemId].push(alert);
+            return acc;
+        }, {});
+
+        const toBuy = scopedItems.filter(item => {
+            const hasAlert = !!alertByItemId[item.id];
+            return item.quantity <= item.restock || item.onShoppingList === true || hasAlert;
+        });
+
+        renderShoppingList(toBuy, alertByItemId);
     } catch (err) {
         console.error(err);
     }
 }
 
-function renderShoppingList(items) {
+function renderShoppingList(items, alertByItemId) {
     const listContainer = document.getElementById('shopping-list');
     listContainer.innerHTML = '';
 
     if (items.length === 0) {
         listContainer.innerHTML = '<div class="empty-state">Nothing to procure.</div>';
         return;
+    }
+
+    if (currentShoppingScope === 'shared') {
+        const activeAlerts = Object.values(alertByItemId).flat();
+        if (activeAlerts.length > 0) {
+            const strip = document.createElement('div');
+            strip.className = 'active-alert-strip';
+            strip.textContent = `Active shared alerts: ${activeAlerts.length}`;
+            listContainer.appendChild(strip);
+        }
     }
 
     const grouped = items.reduce((acc, item) => {
@@ -240,7 +460,16 @@ function renderShoppingList(items) {
             const itemDiv = document.createElement('div');
             itemDiv.className = 'shop-item';
             
-            const reason = item.onShoppingList ? "Manual Add" : `Low (${item.quantity} ${item.unit})`;
+            const itemAlerts = (alertByItemId[item.id] || []).sort((a, b) => new Date(b.raisedAt) - new Date(a.raisedAt));
+            const latestAlert = itemAlerts[0];
+            const alertReason = latestAlert
+                ? `${getAlertMeta(latestAlert.urgency).label} • Raised by ${latestAlert.raisedBy || 'Roommate'} ${formatRelativeTime(latestAlert.raisedAt)}`
+                : null;
+
+            const reason = alertReason || (item.onShoppingList ? 'Manual Add' : `Low (${item.quantity} ${item.unit})`);
+            const handleBtn = latestAlert
+                ? `<button class="btn-handle-alert" onclick="markAlertHandled(${latestAlert.id})">Handled</button>`
+                : '';
 
             itemDiv.innerHTML = `
                 <div class="shop-item-info">
@@ -248,6 +477,7 @@ function renderShoppingList(items) {
                     <div class="shop-item-meta">${reason}</div>
                 </div>
                 <div style="display:flex; gap:10px; align-items:center;">
+                    ${handleBtn}
                     <button class="btn-edit-recipe" onclick="editInventoryItem(${item.id})">✎</button>
                     <button class="btn-buy" onclick="openRestockModal(${item.id}, '${item.name}')">
                         BOUGHT
@@ -668,7 +898,9 @@ window.editInventoryItem = async function(id = null) {
         restock: item.restock || 5,
         critical: item.critical || 2,
         store: item.store || stores[0],
-        category: item.category || 'Pantry'
+        category: item.category || 'Pantry',
+        scope: item.scope || currentInventoryScope,
+        ownerUserId: item.ownerUserId || getCurrentUserLabel()
     };
 
     const html = `
@@ -688,6 +920,12 @@ window.editInventoryItem = async function(id = null) {
         <div class="form-group" style="display:flex; gap:10px;">
             <div style="flex:1"><label>Restock (<)</label><input type="number" id="inv-restock" value="${data.restock}"></div>
             <div style="flex:1"><label>Critical (<)</label><input type="number" id="inv-critical" value="${data.critical}"></div>
+        </div>
+        <div class="form-group"><label>Scope</label>
+            <select id="inv-scope">
+                <option value="shared" ${data.scope === 'shared'?'selected':''}>Shared Home</option>
+                <option value="personal" ${data.scope === 'personal'?'selected':''}>My Items</option>
+            </select>
         </div>
         <div class="form-group">
             <label>Store</label>
@@ -719,6 +957,8 @@ async function saveInventory() {
         unit: document.getElementById('inv-unit').value,
         restock: parseFloat(document.getElementById('inv-restock').value) || 0,
         critical: parseFloat(document.getElementById('inv-critical').value) || 0,
+        scope: document.getElementById('inv-scope').value,
+        ownerUserId: getCurrentUserLabel(),
         store: document.getElementById('inv-store').value,
         category: document.getElementById('inv-category').value
     };
@@ -726,15 +966,14 @@ async function saveInventory() {
     if (id) { 
         const oldItem = await db.get('inventory', parseInt(id));
         if (oldItem) item.onShoppingList = oldItem.onShoppingList;
+        if (oldItem && oldItem.ownerUserId && item.scope === 'personal') item.ownerUserId = oldItem.ownerUserId;
         item.id = parseInt(id); 
         await db.update('inventory', item); 
     } 
     else { await db.add('inventory', item); }
     
     closeModal();
-    const activeView = document.querySelector('.active-view').id;
-    if(activeView === 'view-inventory') loadInventoryView();
-    if(activeView === 'view-shopping') loadShoppingView();
+    refreshActiveView();
 }
 
 // --- FORM: Restock ---
@@ -758,8 +997,17 @@ async function processRestock() {
     const item = items.find(i => i.id === id);
     if (item) {
         item.quantity += qty;
-        item.onShoppingList = false; 
+        item.onShoppingList = false;
         await db.update('inventory', item);
+
+        const allAlerts = await db.getAll('alerts');
+        const openAlerts = allAlerts.filter(a => a.itemId === item.id && a.status === 'active');
+        for (const alert of openAlerts) {
+            alert.status = 'handled';
+            alert.handledBy = getCurrentUserLabel();
+            alert.handledAt = new Date().toISOString();
+            await db.update('alerts', alert);
+        }
     }
 
     closeModal();
@@ -942,9 +1190,6 @@ window.deleteItem = async function(store, id) {
     if(confirm("Delete?")) {
         await db.delete(store, id);
         closeModal();
-        const activeView = document.querySelector('.active-view').id;
-        if(activeView === 'view-inventory') loadInventoryView();
-        if(activeView === 'view-cooking') loadCookingView();
-        if(activeView === 'view-shopping') loadShoppingView();
+        refreshActiveView();
     }
 }

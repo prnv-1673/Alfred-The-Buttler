@@ -1,11 +1,11 @@
 /**
- * ALFRED - Database Layer (Version 5: Meal Types)
+ * ALFRED - Database Layer (Version 6: Shared Alerts + Item Scope)
  */
 
 class AlfredDB {
     constructor() {
         this.dbName = 'Alfred_DB'; 
-        this.dbVersion = 5; // Bumped for Meal Types
+        this.dbVersion = 6; // Bumped for shared alerts + scope support
         this.db = null;
     }
 
@@ -29,6 +29,13 @@ class AlfredDB {
                 }
                 if (!db.objectStoreNames.contains('settings')) {
                     db.createObjectStore('settings', { keyPath: 'id' });
+                }
+                if (!db.objectStoreNames.contains('alerts')) {
+                    const store = db.createObjectStore('alerts', { keyPath: 'id', autoIncrement: true });
+                    store.createIndex('status', 'status', { unique: false });
+                    store.createIndex('urgency', 'urgency', { unique: false });
+                    store.createIndex('itemId', 'itemId', { unique: false });
+                    store.createIndex('raisedAt', 'raisedAt', { unique: false });
                 }
             };
 
@@ -119,6 +126,7 @@ class AlfredDB {
             const store = tx.objectStore('settings');
             store.put({ id: 'stores', options: ['Esselunga', 'Indian Shop', 'Lidl', 'Carrefour', 'Pharmacy'] });
             store.put({ id: 'categories', options: ['Groceries', 'Transport', 'Eating Out', 'Shopping', 'Bills', 'Gifts'] });
+            store.put({ id: 'profileName', value: 'Roommate' });
         }
 
         // 2. Inventory

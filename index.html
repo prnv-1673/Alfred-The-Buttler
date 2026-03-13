@@ -34,14 +34,23 @@
 
     <!-- MAIN VIEWS CONTAINER -->
     <main id="main-container">
+        <div id="inline-notice" class="inline-notice hidden" aria-live="polite"></div>
         
         <!-- VIEW 1: STORE (Inventory) -->
         <section id="view-inventory" class="view active-view">
+            <div class="scope-toggle" role="tablist" aria-label="Inventory scope">
+                <button class="scope-btn active" data-scope-target="inventory" data-scope="shared" role="tab">Shared Home</button>
+                <button class="scope-btn" data-scope-target="inventory" data-scope="personal" role="tab">My Items</button>
+            </div>
             <div id="inventory-list" class="list-container"></div>
         </section>
 
         <!-- VIEW 2: PROCURE (Shopping) -->
         <section id="view-shopping" class="view">
+            <div class="scope-toggle" role="tablist" aria-label="Procure scope">
+                <button class="scope-btn active" data-scope-target="shopping" data-scope="shared" role="tab">Shared To Buy</button>
+                <button class="scope-btn" data-scope-target="shopping" data-scope="personal" role="tab">My To Buy</button>
+            </div>
             <div id="shopping-list" class="list-container"></div>
         </section>
 
